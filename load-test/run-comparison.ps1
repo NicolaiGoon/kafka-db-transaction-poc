@@ -21,6 +21,9 @@ param(
   [string]$Duration = '30s',
   [double]$InvalidRatio = 0.1,
   [string[]]$Endpoints = @('/items/pooled', '/items/chained'),
+  # Use a locally installed k6 binary (targets localhost:8080). Without this, k6 runs via Docker
+  # (grafana/k6) and reaches the app at host.docker.internal:8080.
+  [switch]$UseLocalK6,
   [string]$BaseUrlForK6 = 'http://host.docker.internal:8080',
   [string]$Topic = 'item-created',
   [int]$Partitions = 12,
@@ -68,18 +71,36 @@ function Get-KafkaCount {
 
 function Invoke-K6 {
   param([string]$Endpoint)
-  $dockerArgs = @(
-    'run', '--rm', '-i', '--add-host=host.docker.internal:host-gateway',
-    '-e', "BASE_URL=$BaseUrlForK6",
-    '-e', "ENDPOINT=$Endpoint",
-    '-e', "VUS=$Vus",
-    '-e', "DURATION=$Duration",
-    '-e', "INVALID_RATIO=$InvalidRatio",
-    'grafana/k6', 'run', '--quiet', '-'
-  )
-  $raw = Get-Content $scriptPath -Raw | docker @dockerArgs 2>$null
+  if ($UseLocalK6) {
+    # Locally installed k6 binary; targets the app directly on localhost.
+    $k6Args = @(
+      'run', '--quiet',
+      '-e', "BASE_URL=http://localhost:8080",
+      '-e', "ENDPOINT=$Endpoint",
+      '-e', "VUS=$Vus",
+      '-e', "DURATION=$Duration",
+      '-e', "INVALID_RATIO=$InvalidRatio",
+      $scriptPath
+    )
+    $raw = & k6 @k6Args 2>$null
+    $reach = 'http://localhost:8080'
+  }
+  else {
+    # k6 via Docker; reaches the host app at host.docker.internal. Script is piped over stdin.
+    $dockerArgs = @(
+      'run', '--rm', '-i', '--add-host=host.docker.internal:host-gateway',
+      '-e', "BASE_URL=$BaseUrlForK6",
+      '-e', "ENDPOINT=$Endpoint",
+      '-e', "VUS=$Vus",
+      '-e', "DURATION=$Duration",
+      '-e', "INVALID_RATIO=$InvalidRatio",
+      'grafana/k6', 'run', '--quiet', '-'
+    )
+    $raw = Get-Content $scriptPath -Raw | docker @dockerArgs 2>$null
+    $reach = $BaseUrlForK6
+  }
   $jsonLine = $raw | Where-Object { $_.TrimStart().StartsWith('{') } | Select-Object -Last 1
-  if (-not $jsonLine) { throw "k6 produced no summary - is the app reachable at $BaseUrlForK6 ?" }
+  if (-not $jsonLine) { throw "k6 produced no summary - is the app reachable at $reach ?" }
   return $jsonLine | ConvertFrom-Json
 }
 

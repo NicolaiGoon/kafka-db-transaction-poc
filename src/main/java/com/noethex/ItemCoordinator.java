@@ -51,7 +51,14 @@ public class ItemCoordinator {
         KafkaProducer<String, byte[]> producer = pooled.producer();
         boolean discardProducer = false;
         try {
-            producer.beginTransaction();
+            try {
+                producer.beginTransaction();
+            } catch (KafkaException beginFailure) {
+                // Could not start a transaction (e.g. fenced or broker error); the producer must
+                // not be reused or the next borrower inherits a broken one.
+                discardProducer = true;
+                throw new ItemCreationException("Could not begin Kafka transaction", beginFailure);
+            }
 
             Item item;
             try {

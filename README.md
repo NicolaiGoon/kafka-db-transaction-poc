@@ -70,7 +70,17 @@ even while many requests fail). k6 runs via Docker, so no local install is neede
 With the compose stack up and the app running (prod mode), run:
 
 ```powershell
+# uses a locally installed k6 binary (targets localhost:8080)
+./load-test/run-comparison.ps1 -UseLocalK6 -Vus 30 -Duration 15s -InvalidRatio 0.1
+
+# or omit -UseLocalK6 to run k6 via Docker (grafana/k6, reaches the app at host.docker.internal)
 ./load-test/run-comparison.ps1 -Vus 30 -Duration 15s -InvalidRatio 0.1
+```
+
+To run k6 directly for a single endpoint (load only, no DB/Kafka reconciliation):
+
+```powershell
+k6 run -e BASE_URL=http://localhost:8080 -e ENDPOINT=/items/pooled -e VUS=30 -e DURATION=15s load-test/item-load-test.js
 ```
 
 `InvalidRatio` is the fraction of requests sent with an invalid payload (missing the NOT NULL

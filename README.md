@@ -1,176 +1,61 @@
 # kafka-db-transaction-poc
 
-This project uses Quarkus, the Supersonic Subatomic Java Framework.
+Quarkus POC comparing two ways to write a row to PostgreSQL **and** publish an `item-created`
+event to Kafka as one all-or-nothing unit: `201 Created` if both commit, `500` if anything fails —
+**no after-the-fact compensation**. Same flow, two implementations exposed at different paths.
 
-If you want to learn more about Quarkus, please visit its website: <https://quarkus.io/>.
+## The two approaches
 
-## Architecture
+### A — `POST /items/pooled` (pool of transactional producers)
+- [ItemResource](src/main/java/com/noethex/ItemResource.java) → [ItemCoordinator](src/main/java/com/noethex/ItemCoordinator.java) + [KafkaTransactionalProducerPool](src/main/java/com/noethex/KafkaTransactionalProducerPool.java)
+- Opens a Kafka transaction around a fresh JTA/DB transaction (`QuarkusTransaction.requiringNew()`). The Kafka send is awaited *inside* the DB transaction (so a broker failure rolls the DB back); DB commits first, Kafka second.
+- A transactional producer can only run **one** transaction at a time, so each request borrows its own producer from a pool. `item.pooled.kafka.tx.pool-size` = max concurrent transactions → **scales with concurrency**.
+- Topic: `item-created-pooled`.
 
-Flow: `POST /items` → persist the item to PostgreSQL **and** publish an `item-created` event to
-Kafka inside a single chained transaction → `201 Created` if both commit, `500` if anything fails.
+### B — `POST /items/chained` (SmallRye `KafkaTransactions`)
+- [ItemResource](src/main/java/com/noethex/ItemResource.java) → [ItemTxCoordinator](src/main/java/com/noethex/ItemTxCoordinator.java)
+- The documented Quarkus pattern: `KafkaTransactions` emitter + `@Transactional`, chaining the Kafka and Hibernate ORM transactions.
+- It wraps a **single** producer, so `@Bulkhead(1)` serializes access — only one transaction at a time. Correct, but under load most concurrent requests are rejected fast → **does not scale**.
+- Topic: `item-created-chained`.
 
-- **[ItemResource](src/main/java/com/noethex/ItemResource.java)** – REST endpoint. Blocking
-  (`@Blocking`) because the transaction uses blocking JDBC and the blocking Kafka transactional
-  producer API, so it runs on a worker thread.
-- **[ItemCoordinator](src/main/java/com/noethex/ItemCoordinator.java)** – opens a Kafka
-  transaction around a fresh JTA/DB transaction (`QuarkusTransaction.requiringNew()`). The Kafka
-  send is awaited *inside* the DB transaction so a broker failure rolls the DB back; the DB is
-  committed first, then the Kafka transaction is committed. **No compensation / after-the-fact
-  deletion** — any failure before the final commit aborts both sides.
-- **[KafkaTransactionalProducerPool](src/main/java/com/noethex/KafkaTransactionalProducerPool.java)**
-  – a pool of transactional producers, each with its own `transactional.id`. A transactional
-  producer can only run one transaction at a time, so each concurrent request borrows a dedicated
-  producer; this is what lets the service handle many concurrent create transactions without
-  collisions. `item.kafka.tx.pool-size` == max concurrent transactions.
+### Consistency caveat (both)
+There is **no true 2PC** with Kafka (not an XA resource); this is best-effort one-phase-commit. The only divergence window is the final `commitTransaction()` failing *after* the DB committed (row exists, event missing) — logged for reconciliation. DB-first ordering ensures the reverse (event without row) can never happen. For strict atomicity, use the transactional-outbox pattern.
 
-### The one consistency caveat
+## Run it
 
-There is **no true 2PC** between PostgreSQL and Kafka (Kafka is not an XA resource). This is
-**best-effort one-phase-commit**: the only divergence window is a failure of the final
-`commitTransaction()` *after* the DB has committed — the row exists but the event was not
-published. DB-first commit ordering guarantees the inverse (a published event for a missing row)
-can never happen; such cases are logged for reconciliation, and the producer is discarded. For
-strict end-to-end atomicity, use the transactional-outbox pattern (event row written in the same
-DB transaction, relayed to Kafka by CDC/poller).
+Needs Docker. [`docker-compose.yml`](docker-compose.yml) starts Kafka (`:9092`), Kafka UI (<http://localhost:8085>), PostgreSQL (`:5432`), Adminer (<http://localhost:8086>). The app's `%prod` config in [application.properties](src/main/resources/application.properties) points at these by default.
 
-## Running in production mode (Docker Compose)
+```shell
+docker compose up -d                            # infra
+./mvnw package                                  # build (needs JDK 21)
+java -jar target/quarkus-app/quarkus-run.jar    # runs in prod profile
+```
 
-[`docker-compose.yml`](docker-compose.yml) spins up the supporting infrastructure:
-
-| Service     | URL / port                | Notes                                                       |
-|-------------|---------------------------|-------------------------------------------------------------|
-| Kafka       | `localhost:9092`          | Single-broker KRaft, configured for transactions            |
-| Kafka UI    | <http://localhost:8085>   | Browse topics / messages                                    |
-| PostgreSQL  | `localhost:5432` (`items`)| User / password: `quarkus` / `quarkus`                      |
-| Adminer     | <http://localhost:8086>   | System: PostgreSQL, Server: `postgres`, `quarkus`/`quarkus` |
-
-The `%prod` settings in [`application.properties`](src/main/resources/application.properties)
-default to these endpoints (override with `KAFKA_BOOTSTRAP_SERVERS`, `DB_URL`, `DB_USER`,
-`DB_PASSWORD` if you deploy elsewhere or containerize the app).
-
-```shell script
-docker compose up -d                         # start Kafka, Kafka UI, PostgreSQL, Adminer
-./mvnw package                               # build the runnable jar
-java -jar target/quarkus-app/quarkus-run.jar # runs with the prod profile by default
-
-# smoke test both endpoints (expect HTTP 201)
+Smoke test (expect `201`):
+```shell
 curl -i -X POST localhost:8080/items/pooled  -H 'Content-Type: application/json' -d '{"name":"a","payload":"b"}'
-curl -i -X POST localhost:8080/items/chained -H 'Content-Type: application/json' -d '{"name":"c","payload":"d"}'
-
-docker compose down                          # stop (add -v to also drop the DB volume)
+curl -i -X POST localhost:8080/items/chained -H 'Content-Type: application/json' -d '{"name":"a","payload":"b"}'
 ```
 
-## Load testing: throughput comparison + atomicity check
+## Compare throughput + verify atomicity
 
-[`load-test/`](load-test) contains a [k6](https://k6.io/) script and a runner that load both
-endpoints and then **reconcile the rows committed to PostgreSQL against the events committed to
-Kafka** — proving each implementation is all-or-nothing (db count == kafka count == HTTP 201s,
-even while many requests fail). k6 runs via Docker, so no local install is needed.
+[`load-test/`](load-test) load-tests both endpoints with [k6](https://k6.io/), then reconciles the
+rows committed to PostgreSQL against the events committed to Kafka (counted with a `read_committed`
+consumer) to prove each is all-or-nothing: **db count == kafka count == HTTP 201s**.
 
-With the compose stack up and the app running (prod mode), run:
-
+With the stack up and the app running:
 ```powershell
-# uses a locally installed k6 binary (targets localhost:8080)
-./load-test/run-comparison.ps1 -UseLocalK6 -Vus 30 -Duration 15s -InvalidRatio 0.1
-
-# or omit -UseLocalK6 to run k6 via Docker (grafana/k6, reaches the app at host.docker.internal)
-./load-test/run-comparison.ps1 -Vus 30 -Duration 15s -InvalidRatio 0.1
+# -UseLocalK6 uses your installed k6; omit it to run k6 via Docker.
+# -InvalidRatio is the fraction of deliberately-invalid requests (force rollback); 0 = all valid.
+./load-test/run-comparison.ps1 -UseLocalK6 -Vus 30 -Duration 15s -InvalidRatio 0
 ```
 
-To run k6 directly for a single endpoint (load only, no DB/Kafka reconciliation):
-
-```powershell
-k6 run -e BASE_URL=http://localhost:8080 -e ENDPOINT=/items/pooled -e VUS=30 -e DURATION=15s load-test/item-load-test.js
-```
-
-`InvalidRatio` is the fraction of requests sent with an invalid payload (missing the NOT NULL
-`name`); those force a DB failure so the DB+Kafka transaction must roll back. The runner resets
-state between implementations (truncates the table, recreates the topic) and counts Kafka with a
-`read_committed` consumer (so aborted records and transaction markers are excluded).
-
-Example result (30 VUs, 15s):
-
+Example output:
 ```
 Endpoint        Creates/s Reqs/s p95 ms Created Failed DbRows KafkaMsgs Consistent
---------        --------- ------ ------ ------- ------ ------ --------- ----------
-/items/pooled       535.7  599.2   79.1    8054    955   8054      8054       True
-/items/chained       54.0 9573.8    4.8     810 142853    810       810       True
-
-PASS: for every implementation DB rows == Kafka msgs == 201s (atomic; failures rolled back both sides).
+/items/pooled       522.6  522.6   77.7    7862      0   7862      7862       True
+/items/chained       20.7  630.9   54.5     311   9181    311       311       True
+PASS: DB rows == Kafka msgs == 201s for both.
 ```
-
-Two things this shows:
-
-- **Throughput**: the pooled path sustains ~10x the *successful creates/s* of the chained path.
-  The chained path's `@Bulkhead(1)` serializes to one transaction at a time, so under concurrency
-  the vast majority of requests are rejected fast (high `Reqs/s`, tiny `Creates/s`).
-- **Atomicity / rollback**: for both, `DbRows == KafkaMsgs == Created`. Every failed request
-  (invalid payload → DB rollback, or bulkhead rejection → never started) left **no** row and
-  **no** event, so the two stores never diverge.
-
-## Running the application in dev mode
-
-You can run your application in dev mode that enables live coding using:
-
-```shell script
-./mvnw quarkus:dev
-```
-
-> **_NOTE:_**  Quarkus now ships with a Dev UI, which is available in dev mode only at <http://localhost:8080/q/dev/>.
-
-## Packaging and running the application
-
-The application can be packaged using:
-
-```shell script
-./mvnw package
-```
-
-It produces the `quarkus-run.jar` file in the `target/quarkus-app/` directory.
-Be aware that it’s not an _über-jar_ as the dependencies are copied into the `target/quarkus-app/lib/` directory.
-
-The application is now runnable using `java -jar target/quarkus-app/quarkus-run.jar`.
-
-If you want to build an _über-jar_, execute the following command:
-
-```shell script
-./mvnw package -Dquarkus.package.jar.type=uber-jar
-```
-
-The application, packaged as an _über-jar_, is now runnable using `java -jar target/*-runner.jar`.
-
-## Creating a native executable
-
-You can create a native executable using:
-
-```shell script
-./mvnw package -Dnative
-```
-
-Or, if you don't have GraalVM installed, you can run the native executable build in a container using:
-
-```shell script
-./mvnw package -Dnative -Dquarkus.native.container-build=true
-```
-
-You can then execute your native executable with: `./target/kafka-db-transaction-poc-1.0-SNAPSHOT-runner`
-
-If you want to learn more about building native executables, please consult <https://quarkus.io/guides/maven-tooling>.
-
-## Related Guides
-
-- REST Jackson ([guide](https://quarkus.io/guides/rest#json-serialisation)): Jackson serialization support for Quarkus
-  REST. This extension is not compatible with the quarkus-resteasy extension, or any of the extensions that depend on it
-- Apache Kafka Client ([guide](https://quarkus.io/guides/kafka)): Connect to Apache Kafka with its native API, including
-  the transactional producer used here ([transactions](https://quarkus.io/guides/kafka#kafka-transactions))
-- Hibernate ORM with Panache ([guide](https://quarkus.io/guides/hibernate-orm-panache)): Blocking JPA persistence
-- JDBC Driver - PostgreSQL ([guide](https://quarkus.io/guides/datasource)): Connect to the PostgreSQL database via JDBC
-- Narayana JTA ([guide](https://quarkus.io/guides/transaction)): JTA transaction support (`QuarkusTransaction`)
-
-## Provided Code
-
-### REST
-
-Easily start your REST Web Services
-
-[Related guide section...](https://quarkus.io/guides/getting-started-reactive#reactive-jax-rs-resources)
+- **Throughput**: pooled handles ~25× the creates/s of chained — chained's `@Bulkhead(1)` rejects almost everything under concurrency (note its huge `Failed`/`Reqs/s`, tiny `Creates/s`).
+- **Atomicity**: for both, `DbRows == KafkaMsgs == Created`; every failed request left no row and no event.

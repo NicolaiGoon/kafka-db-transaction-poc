@@ -25,7 +25,12 @@ param(
   # (grafana/k6) and reaches the app at host.docker.internal:8080.
   [switch]$UseLocalK6,
   [string]$BaseUrlForK6 = 'http://host.docker.internal:8080',
-  [string]$Topic = 'item-created',
+  # Each approach publishes to its own topic (see application.properties), so they are reconciled
+  # independently.
+  [hashtable]$TopicByEndpoint = @{
+    '/items/pooled'  = 'item-created-pooled'
+    '/items/chained' = 'item-created-chained'
+  },
   [int]$Partitions = 12,
   [string]$PgContainer = 'kdt-postgres',
   [string]$KafkaContainer = 'kdt-kafka'
@@ -42,6 +47,7 @@ function Test-AppUp {
 }
 
 function Reset-State {
+  param([string]$Topic)
   # Clean DB baseline.
   docker exec $PgContainer psql -U quarkus -d items -c "TRUNCATE TABLE items;" *>$null
   # Fresh topic so committed-record counts are absolute for this run.
@@ -61,6 +67,7 @@ function Get-DbCount {
 }
 
 function Get-KafkaCount {
+  param([string]$Topic)
   # Count COMMITTED data records only (read_committed hides aborted records and tx markers).
   $lines = docker exec $KafkaContainer /opt/kafka/bin/kafka-console-consumer.sh `
     --bootstrap-server localhost:9092 --topic $Topic --from-beginning `
@@ -112,12 +119,15 @@ Write-Host "Load test: VUs=$Vus Duration=$Duration InvalidRatio=$InvalidRatio" -
 $results = @()
 
 foreach ($ep in $Endpoints) {
-  Write-Host "`n--- $ep ---" -ForegroundColor Cyan
-  Reset-State
+  $topic = $TopicByEndpoint[$ep]
+  if (-not $topic) { throw "No topic mapped for endpoint '$ep' - add it to -TopicByEndpoint." }
+
+  Write-Host "`n--- $ep (topic: $topic) ---" -ForegroundColor Cyan
+  Reset-State -Topic $topic
   $k = Invoke-K6 -Endpoint $ep
 
   $dbCount = Get-DbCount
-  $kafkaCount = Get-KafkaCount
+  $kafkaCount = Get-KafkaCount -Topic $topic
   $created = [int]$k.items_created
   $failed = [int]$k.items_failed
   $durS = [double]$k.duration_s

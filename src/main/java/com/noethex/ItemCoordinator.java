@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.quarkus.narayana.jta.QuarkusTransaction;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+
 import java.util.concurrent.ExecutionException;
+
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.KafkaException;
@@ -39,7 +41,7 @@ public class ItemCoordinator {
     public ItemCoordinator(ItemRepository repository,
                            KafkaTransactionalProducerPool producerPool,
                            ObjectMapper objectMapper,
-                           @ConfigProperty(name = "item.kafka.topic", defaultValue = "item-created") String topic) {
+                           @ConfigProperty(name = "item.pooled.kafka.topic", defaultValue = "item-created-pooled") String topic) {
         this.repository = repository;
         this.producerPool = producerPool;
         this.objectMapper = objectMapper;

@@ -37,16 +37,16 @@ public class KafkaTransactionalProducerPool {
     @ConfigProperty(name = "kafka.bootstrap.servers")
     String bootstrapServers;
 
-    @ConfigProperty(name = "item.kafka.tx.pool-size", defaultValue = "16")
+    @ConfigProperty(name = "item.pooled.kafka.tx.pool-size", defaultValue = "16")
     int poolSize;
 
-    @ConfigProperty(name = "item.kafka.tx.id-prefix", defaultValue = "item-tx")
+    @ConfigProperty(name = "item.pooled.kafka.tx.id-prefix", defaultValue = "item-pooled-tx")
     String transactionalIdPrefix;
 
-    @ConfigProperty(name = "item.kafka.tx.borrow-timeout", defaultValue = "PT5S")
+    @ConfigProperty(name = "item.pooled.kafka.tx.borrow-timeout", defaultValue = "PT5S")
     Duration borrowTimeout;
 
-    @ConfigProperty(name = "item.kafka.tx.transaction-timeout", defaultValue = "PT10S")
+    @ConfigProperty(name = "item.pooled.kafka.tx.transaction-timeout", defaultValue = "PT10S")
     Duration transactionTimeout;
 
     private final List<PooledProducer> allProducers = new ArrayList<>();

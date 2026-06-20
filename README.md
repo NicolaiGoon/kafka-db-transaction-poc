@@ -33,6 +33,71 @@ can never happen; such cases are logged for reconciliation, and the producer is 
 strict end-to-end atomicity, use the transactional-outbox pattern (event row written in the same
 DB transaction, relayed to Kafka by CDC/poller).
 
+## Running in production mode (Docker Compose)
+
+[`docker-compose.yml`](docker-compose.yml) spins up the supporting infrastructure:
+
+| Service     | URL / port                | Notes                                                       |
+|-------------|---------------------------|-------------------------------------------------------------|
+| Kafka       | `localhost:9092`          | Single-broker KRaft, configured for transactions            |
+| Kafka UI    | <http://localhost:8085>   | Browse topics / messages                                    |
+| PostgreSQL  | `localhost:5432` (`items`)| User / password: `quarkus` / `quarkus`                      |
+| Adminer     | <http://localhost:8086>   | System: PostgreSQL, Server: `postgres`, `quarkus`/`quarkus` |
+
+The `%prod` settings in [`application.properties`](src/main/resources/application.properties)
+default to these endpoints (override with `KAFKA_BOOTSTRAP_SERVERS`, `DB_URL`, `DB_USER`,
+`DB_PASSWORD` if you deploy elsewhere or containerize the app).
+
+```shell script
+docker compose up -d                         # start Kafka, Kafka UI, PostgreSQL, Adminer
+./mvnw package                               # build the runnable jar
+java -jar target/quarkus-app/quarkus-run.jar # runs with the prod profile by default
+
+# smoke test both endpoints (expect HTTP 201)
+curl -i -X POST localhost:8080/items/pooled  -H 'Content-Type: application/json' -d '{"name":"a","payload":"b"}'
+curl -i -X POST localhost:8080/items/chained -H 'Content-Type: application/json' -d '{"name":"c","payload":"d"}'
+
+docker compose down                          # stop (add -v to also drop the DB volume)
+```
+
+## Load testing: throughput comparison + atomicity check
+
+[`load-test/`](load-test) contains a [k6](https://k6.io/) script and a runner that load both
+endpoints and then **reconcile the rows committed to PostgreSQL against the events committed to
+Kafka** — proving each implementation is all-or-nothing (db count == kafka count == HTTP 201s,
+even while many requests fail). k6 runs via Docker, so no local install is needed.
+
+With the compose stack up and the app running (prod mode), run:
+
+```powershell
+./load-test/run-comparison.ps1 -Vus 30 -Duration 15s -InvalidRatio 0.1
+```
+
+`InvalidRatio` is the fraction of requests sent with an invalid payload (missing the NOT NULL
+`name`); those force a DB failure so the DB+Kafka transaction must roll back. The runner resets
+state between implementations (truncates the table, recreates the topic) and counts Kafka with a
+`read_committed` consumer (so aborted records and transaction markers are excluded).
+
+Example result (30 VUs, 15s):
+
+```
+Endpoint        Creates/s Reqs/s p95 ms Created Failed DbRows KafkaMsgs Consistent
+--------        --------- ------ ------ ------- ------ ------ --------- ----------
+/items/pooled       535.7  599.2   79.1    8054    955   8054      8054       True
+/items/chained       54.0 9573.8    4.8     810 142853    810       810       True
+
+PASS: for every implementation DB rows == Kafka msgs == 201s (atomic; failures rolled back both sides).
+```
+
+Two things this shows:
+
+- **Throughput**: the pooled path sustains ~10x the *successful creates/s* of the chained path.
+  The chained path's `@Bulkhead(1)` serializes to one transaction at a time, so under concurrency
+  the vast majority of requests are rejected fast (high `Reqs/s`, tiny `Creates/s`).
+- **Atomicity / rollback**: for both, `DbRows == KafkaMsgs == Created`. Every failed request
+  (invalid payload → DB rollback, or bulkhead rejection → never started) left **no** row and
+  **no** event, so the two stores never diverge.
+
 ## Running the application in dev mode
 
 You can run your application in dev mode that enables live coding using:
